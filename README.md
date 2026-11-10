@@ -18,3 +18,17 @@ warmer stop <name>
 ```
 
 `ps` shows `running` (backend up) or `warm` (backend asleep, port still open). `stop` removes the entry for good. Ctrl-C on a foreground `run` is the same as `stop`.
+
+## Examples
+
+```
+# foreground, backend on 8081 exposed on 8080, sleeps after 5 min idle
+warmer run --idle 300 -p 8080:8081 python3 -m http.server 8081
+
+# detached, named
+warmer run -d --name llama -p 9000:9001 llama-server --port 9001 -m model.gguf
+
+warmer ps            # NAME   STATE    PORT
+warmer logs -f llama
+warmer stop llama
+```

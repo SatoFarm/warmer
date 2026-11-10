@@ -1,0 +1,179 @@
+#!/bin/bash
+# End-to-end tests against a throwaway HOME. Needs python3, curl.
+cd "$(dirname "$0")/.." && cargo build -q || exit 1
+export PATH=$PWD/target/debug:$PATH HOME=$(mktemp -d)
+W=$HOME/w; mkdir $W; cd $W
+pass=0; fail=0
+ok()  { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1   [$2]"; fi; }
+code(){ curl -s -m 5 -o /dev/null -w '%{http_code}' "localhost:$1/"; }
+status(){ warmer ps | grep "^$1 " | grep -oE ' (warm|running)  ' | tr -d ' '; }
+alivepid(){ kill -0 "$1" 2>/dev/null; }
+cleanup(){ pkill -x warmerd; sleep .3; rm -rf "$HOME"; }
+trap cleanup EXIT
+
+# backend: records its pid on every start, serves http
+cat > be.sh <<'X'
+#!/bin/sh
+echo $$ >> "$STARTS"
+exec python3 -u -m http.server "$1" --bind 127.0.0.1
+X
+chmod +x be.sh
+export STARTS=$W/starts
+
+echo "# basic / parsing / names"
+out=$(warmer run -d -p 19001:19002 ./be.sh 19002); n=$(echo "$out" | head -1)
+ok "random name docker-style" '[[ $n =~ ^[a-z]+_[a-z]+$ ]]'
+ok "mapping printed" 'echo "$out" | grep -q "127.0.0.1:19001 -> 19002"'
+ok "ps shows warm initially" '[ "$(status $n)" = warm ]'
+ok "no start before first request" '[ ! -s starts ]'
+ok "cold boot serves 200" '[ "$(code 19001)" = 200 ]'
+ok "ps shows running" '[ "$(status $n)" = running ]'
+ok "one start" '[ "$(wc -l < starts)" = 1 ]'
+warmer stop $n >/dev/null
+ok "stop removes entry" '! warmer ps | grep -q "^$n "'
+ok "stop closes port" '[ "$(code 19001)" = 000 ]'
+sleep .3; p=$(tail -1 starts); ok "stop kills backend" '! alivepid $p'
+
+echo "# errors"
+ok "bad -p rejected" '! warmer run -d -p abc ./be.sh 1 2>/dev/null'
+ok "bad -p 4 parts rejected" '! warmer run -d -p 1:2:3:4 true 2>/dev/null'
+ok "no -p rejected" '! warmer run -d true 2>/dev/null'
+ok "stop unknown fails" '! warmer stop nope 2>/dev/null'
+ok "logs unknown fails" '! warmer logs nope 2>/dev/null'
+warmer run -d --name a -p 19010:19011 ./be.sh 19011 >/dev/null
+ok "duplicate name rejected" '! warmer run -d --name a -p 19012:19013 ./be.sh 19013 2>/dev/null'
+ok "port conflict rejected" '! warmer run -d --name b -p 19010:19014 ./be.sh 19014 2>/dev/null'
+ok "failed run leaves no entry" '! warmer ps | grep -q "^b "'
+ok "partial bind leaves nothing" '! warmer run -d --name c -p 19020:1 -p 19010:2 true 2>/dev/null && [ "$(code 19020)" = 000 ]'
+ok "missing command binary: ps still fine" 'warmer run -d --name nb -p 19030:19031 /no/such/bin >/dev/null; [ "$(code 19030)" = 000 ]; warmer ps | grep -q "^nb "'
+ok "missing binary logs the error" 'warmer logs nb | grep -q "spawn"'
+warmer stop nb >/dev/null; warmer stop a >/dev/null
+
+echo "# multi -p and ip form"
+warmer run -d --name m -p 19040:19042 -p 127.0.0.1:19041:19042 ./be.sh 19042 >/dev/null
+ok "both ports work" '[ "$(code 19040)" = 200 ] && [ "$(code 19041)" = 200 ]'
+ok "single backend for both" '[ "$(wc -l < starts)" = 2 ]'   # 1 from earlier + this
+ok "ps lists both ports" 'warmer ps | grep "^m " | grep -q "19040.*19041"'
+warmer stop m >/dev/null
+
+echo "# env + cwd passthrough"
+mkdir sub; cat > sub/envbe.sh <<'X'
+#!/bin/sh
+echo "FOO=$FOO PWD=$(pwd)"
+exec python3 -u -m http.server "$1" --bind 127.0.0.1
+X
+chmod +x sub/envbe.sh
+(cd sub && FOO=bar warmer run -d --name e -p 19050:19051 ./envbe.sh 19051 >/dev/null)
+code 19050 >/dev/null
+ok "client env reaches backend" 'warmer logs e | grep -q "FOO=bar"'
+ok "client cwd reaches backend" 'warmer logs e | grep -q "PWD=.*/sub"'
+warmer stop e >/dev/null
+
+echo "# logs: stderr, backlog, follow"
+cat > lg.sh <<'X'
+#!/bin/sh
+echo out-line; echo err-line >&2
+exec python3 -u -m http.server "$1" --bind 127.0.0.1
+X
+chmod +x lg.sh
+warmer run -d --name l -p 19060:19061 ./lg.sh 19061 >/dev/null; code 19060 >/dev/null
+ok "stdout captured" 'warmer logs l | grep -qx out-line'
+ok "stderr captured" 'warmer logs l | grep -qx err-line'
+warmer logs -f l > follow.out & fp=$!
+sleep .5; code 19060 >/dev/null; code 19060 >/dev/null; sleep .5
+kill $fp 2>/dev/null; wait $fp 2>/dev/null
+ok "follow streams new lines" '[ "$(grep -c "GET /" follow.out)" -ge 2 ]'
+ok "follow has no duplicate backlog" '[ "$(grep -cx out-line follow.out)" = 1 ]'
+warmer stop l >/dev/null
+
+echo "# idle: stops backend, keeps ports; respawn; active conn blocks idle"
+: > starts
+warmer run -d --name i --idle 2 -p 19070:19071 ./be.sh 19071 >/dev/null
+code 19070 >/dev/null; p1=$(tail -1 starts)
+sleep 4
+ok "idle -> warm" '[ "$(status i)" = warm ]'
+ok "idle killed backend" '! alivepid $p1'
+ok "respawn after idle" '[ "$(code 19070)" = 200 ] && [ "$(wc -l < starts)" = 2 ]'
+# hold a connection open past the idle window
+python3 - <<'P' &
+import socket,time
+s=socket.create_connection(("127.0.0.1",19070)); s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); time.sleep(5)
+P
+hp=$!; sleep 4
+ok "open connection keeps backend running" '[ "$(status i)" = running ]'
+wait $hp; sleep 4
+ok "released connection -> idles out" '[ "$(status i)" = warm ]'
+warmer stop i >/dev/null
+
+echo "# concurrent cold boot spawns once"
+: > starts
+warmer run -d --name c1 -p 19080:19081 ./be.sh 19081 >/dev/null
+for k in $(seq 20); do code 19080 > res.$k & done; wait
+ok "all 20 concurrent got 200" '[ "$(cat res.* | grep -o 200 | wc -l)" = 20 ]'
+ok "exactly one spawn" '[ "$(wc -l < starts)" = 1 ]'
+rm -f res.*
+
+echo "# backend dies -> respawn on next request"
+p=$(tail -1 starts); kill -9 $p; sleep .5
+ok "ps shows warm after crash" '[ "$(status c1)" = warm ]'
+ok "next request respawns" '[ "$(code 19080)" = 200 ] && [ "$(wc -l < starts)" = 2 ]'
+warmer stop c1 >/dev/null
+
+echo "# backend exits immediately: fails fast, no hang"
+warmer run -d --name x -p 19090:19091 sh -c 'echo boom; exit 1' >/dev/null
+s=$(date +%s); r=$(code 19090); d=$(( $(date +%s) - s ))
+ok "fails fast (<8s)" '[ $d -lt 8 ]'
+ok "client got no 200" '[ "$r" != 200 ]'
+ok "backend output logged" 'warmer logs x | grep -q boom'
+ok "daemon still healthy" 'warmer ps >/dev/null'
+warmer stop x >/dev/null
+
+echo "# process group: grandchildren die on stop"
+cat > gc.sh <<'X'
+#!/bin/sh
+sleep 300 &
+echo $! >> "$STARTS.gc"
+exec python3 -u -m http.server "$1" --bind 127.0.0.1
+X
+chmod +x gc.sh
+warmer run -d --name g -p 19100:19101 ./gc.sh 19101 >/dev/null; code 19100 >/dev/null
+gp=$(tail -1 starts.gc); ok "grandchild alive" 'alivepid $gp'
+warmer stop g >/dev/null; sleep .5
+ok "grandchild killed" '! alivepid $gp'
+
+echo "# foreground run: ctrl-c == stop"
+python3 - <<'P'
+import subprocess,signal,time,sys
+p=subprocess.Popen(["warmer","run","--name","fg","-p","19110:19111","./be.sh","19111"],stdout=subprocess.PIPE,text=True)
+first=p.stdout.readline().strip()
+time.sleep(.5)
+ps=subprocess.run(["warmer","ps"],capture_output=True,text=True).stdout
+assert first=="fg" and "fg " in ps, (first,ps)
+p.send_signal(signal.SIGINT); p.wait(timeout=10)
+ps=subprocess.run(["warmer","ps"],capture_output=True,text=True).stdout
+assert "fg " not in ps, ps
+P
+ok "foreground ctrl-c removes entry" '[ $? = 0 ]'
+ok "foreground port closed" '[ "$(code 19110)" = 000 ]'
+
+echo "# daemon restart restores, SIGTERM kills backends"
+: > starts
+warmer run -d --name r -p 19120:19121 ./be.sh 19121 >/dev/null; code 19120 >/dev/null; p=$(tail -1 starts)
+pkill -x warmerd; sleep 1
+ok "backend killed with daemon" '! alivepid $p'
+ok "restored as warm after restart" '[ "$(status r)" = warm ]'
+ok "restored entry serves" '[ "$(code 19120)" = 200 ]'
+ok "state file private" '[ "$(stat -c %a $HOME/.warmer/state.json)" = 600 ]'
+
+echo "# daemon crash (SIGKILL): stale sock/lock recovered"
+pkill -9 -x warmerd; sleep .5
+ok "recovers after kill -9" '[ "$(status r)" = warm ] || [ "$(status r)" = running ]'
+ok "restored again, serves" '[ "$(code 19120)" = 200 ]'
+pkill -x warmerd; sleep 1; pkill -f "http.server 1912" 2>/dev/null
+
+echo "# racing first commands start one daemon"
+pkill -x warmerd; sleep .5
+for k in 1 2 3 4 5; do warmer ps >/dev/null & done; wait
+ok "single warmerd" '[ "$(pgrep -cx warmerd)" = 1 ]'
+
+echo; echo "passed=$pass failed=$fail"; [ $fail = 0 ]

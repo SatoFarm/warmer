@@ -30,7 +30,6 @@ pub struct Spec {
     pub ports: Vec<PortMap>,
     pub idle_secs: u64,
     pub cwd: String,
-    pub env: Vec<(String, String)>,
     pub created: u64,
 }
 
@@ -42,7 +41,7 @@ pub struct Row {
 
 #[derive(Serialize, Deserialize)]
 pub enum Req {
-    Run { name: Option<String>, cmd: Vec<String>, ports: Vec<PortMap>, idle_secs: u64, cwd: String, env: Vec<(String, String)> },
+    Run { name: Option<String>, cmd: Vec<String>, ports: Vec<PortMap>, idle_secs: u64, cwd: String },
     Ps,
     Logs { name: String, follow: bool },
     Stop { name: String },

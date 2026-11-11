@@ -126,7 +126,7 @@ async fn main() {
         Cmd::Run { p, detach, name, idle, command } => {
             let ports = p.iter().map(|s| parse_port(s)).collect::<Result<Vec<_>, _>>().unwrap_or_else(|e| die(e));
             let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
-            let req = Req::Run { name, cmd: command, ports, idle_secs: idle, cwd, env: std::env::vars().collect() };
+            let req = Req::Run { name, cmd: command, ports, idle_secs: idle, cwd };
             let spec = match next(&mut call(&req).await).await {
                 Resp::Run(s) => s,
                 Resp::Err(e) => die(e),

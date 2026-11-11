@@ -37,7 +37,7 @@ fn save(db: &Db) {
     let tmp = home().join("state.json.tmp");
     let write = || -> std::io::Result<()> {
         std::fs::write(&tmp, serde_json::to_vec_pretty(&specs)?)?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?; // env may hold secrets
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, home().join("state.json"))
     };
     if let Err(e) = write() {
@@ -129,8 +129,6 @@ async fn connect_backend(e: &Arc<Entry>, backend: u16) -> Result<TcpStream, Stri
             let mut cmd = Command::new(&s.cmd[0]);
             cmd.args(&s.cmd[1..])
                 .current_dir(&s.cwd)
-                .env_clear()
-                .envs(s.env.iter().cloned())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -273,14 +271,14 @@ async fn handle(db: Db, s: UnixStream) -> std::io::Result<()> {
     BufReader::new(r).read_line(&mut line).await?;
     let Ok(req) = serde_json::from_str::<Req>(&line) else { return send(&mut w, &Resp::Err("bad request".into())).await };
     match req {
-        Req::Run { name, cmd, ports, idle_secs, cwd, env } => {
+        Req::Run { name, cmd, ports, idle_secs, cwd } => {
             let name = name.unwrap_or_else(|| random_name(&db));
             let res = if cmd.is_empty() || ports.is_empty() {
                 Err("need a command and at least one -p".to_string())
             } else if db.lock().unwrap().contains_key(&name) {
                 Err(format!("name '{name}' already in use"))
             } else {
-                add(&db, Spec { name, cmd, ports, idle_secs, cwd, env, created: now() }).await.map(|e| e.spec.clone())
+                add(&db, Spec { name, cmd, ports, idle_secs, cwd, created: now() }).await.map(|e| e.spec.clone())
             };
             match res {
                 Ok(spec) => {

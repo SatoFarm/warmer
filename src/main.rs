@@ -17,7 +17,7 @@ struct Cli {
 enum Cmd {
     /// Register a backend and open its ports; stays in the foreground unless -d
     Run {
-        /// HOST:BACKEND or IP:HOST:BACKEND (repeatable)
+        /// HOST:BACKEND, IP:HOST:BACKEND or PATH:BACKEND (repeatable)
         #[arg(short, long = "publish", required = true)]
         p: Vec<String>,
         /// Run in the background and print the mapping
@@ -49,14 +49,18 @@ fn die(m: impl std::fmt::Display) -> ! {
 }
 
 fn parse_port(s: &str) -> Result<PortMap, String> {
-    let bad = || format!("bad -p '{s}', want HOST:BACKEND or IP:HOST:BACKEND");
-    let parts: Vec<&str> = s.split(':').collect();
-    let (bind, h, b) = match parts[..] {
-        [h, b] => ("127.0.0.1", h, b),
-        [ip, h, b] => (ip, h, b),
+    let bad = || format!("bad -p '{s}', want HOST:BACKEND, IP:HOST:BACKEND or SOCKPATH:BACKEND");
+    let (front, b) = s.rsplit_once(':').ok_or_else(bad)?;
+    let backend = b.parse().map_err(|_| bad())?;
+    if front.contains('/') {
+        return Ok(PortMap { bind: String::new(), host: 0, backend, sock: Some(front.into()) });
+    }
+    let (bind, h) = match front.split(':').collect::<Vec<_>>()[..] {
+        [h] => ("127.0.0.1", h),
+        [ip, h] => (ip, h),
         _ => return Err(bad()),
     };
-    Ok(PortMap { bind: bind.into(), host: h.parse().map_err(|_| bad())?, backend: b.parse().map_err(|_| bad())? })
+    Ok(PortMap { bind: bind.into(), host: h.parse().map_err(|_| bad())?, backend, sock: None })
 }
 
 /// Connect to the daemon, spawning it detached if it is not up yet.
@@ -130,7 +134,7 @@ async fn main() {
             };
             println!("{}", spec.name);
             for p in &spec.ports {
-                println!("{}:{} -> {}", p.bind, p.host, p.backend);
+                println!("{} -> {}", p.front(), p.backend);
             }
             if detach {
                 return;
@@ -148,7 +152,7 @@ async fn main() {
             let mut t = vec![vec!["NAME".to_string(), "COMMAND".into(), "CREATED".into(), "STATUS".into(), "PORTS".into()]];
             for r in rows {
                 let s = r.spec;
-                let ports: Vec<_> = s.ports.iter().map(|p| format!("{}:{}->{}", p.bind, p.host, p.backend)).collect();
+                let ports: Vec<_> = s.ports.iter().map(|p| format!("{}->{}", p.front(), p.backend)).collect();
                 t.push(vec![s.name, format!("\"{}\"", s.cmd.join(" ")), ago(s.created), (if r.running { "running" } else { "warm" }).into(), ports.join(", ")]);
             }
             let w: Vec<usize> = (0..5).map(|i| t.iter().map(|r| r[i].chars().count()).max().unwrap()).collect();
@@ -162,5 +166,23 @@ async fn main() {
             Resp::Err(e) => die(e),
             _ => println!("{name}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_forms() {
+        let t = parse_port("127.0.0.1:8080:8081").unwrap();
+        assert_eq!((t.bind.as_str(), t.host, t.backend, t.sock), ("127.0.0.1", 8080, 8081, None));
+        let t = parse_port("8080:8081").unwrap();
+        assert_eq!((t.bind.as_str(), t.host, t.sock), ("127.0.0.1", 8080, None));
+        let s = parse_port("/run/app.sock:8081").unwrap();
+        assert_eq!((s.sock.as_deref(), s.backend, s.front().as_str()), (Some("/run/app.sock"), 8081, "/run/app.sock"));
+        assert!(parse_port("abc").is_err());
+        assert!(parse_port("1:2:3:4").is_err());
+        assert!(parse_port("/run/app.sock:x").is_err());
     }
 }

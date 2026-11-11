@@ -11,6 +11,16 @@ pub struct PortMap {
     pub bind: String,
     pub host: u16,
     pub backend: u16,
+    /// Listen on this unix socket path instead of `bind:host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sock: Option<String>,
+}
+
+impl PortMap {
+    /// Front address for display: "bind:host", or the socket path.
+    pub fn front(&self) -> String {
+        self.sock.clone().unwrap_or_else(|| format!("{}:{}", self.bind, self.host))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]

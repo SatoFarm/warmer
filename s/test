@@ -56,6 +56,24 @@ ok "single backend for both" '[ "$(wc -l < starts)" = 2 ]'   # 1 from earlier + 
 ok "ps lists both ports" 'warmer ps | grep "^m " | grep -q "19040.*19041"'
 warmer stop m >/dev/null
 
+echo "# unix socket front: -p PATH:BACKEND"
+ucode(){ curl -s -m 5 --unix-socket "$1" -o /dev/null -w '%{http_code}' http://x/; }
+warmer run -d --name u -p "$W/be.sock:19201" ./be.sh 19201 >/dev/null
+ok "socket file created" '[ -S "$W/be.sock" ]'
+ok "socket serves 200" '[ "$(ucode "$W/be.sock")" = 200 ]'
+ok "ps shows socket path" 'warmer ps | grep "^u " | grep -q "be\.sock->19201"'
+warmer stop u >/dev/null
+ok "stop removes socket file" '[ ! -e "$W/be.sock" ]'
+echo keep > notsock
+ok "won't clobber a regular file" '! warmer run -d --name n -p "$W/notsock:19202" true 2>/dev/null'
+ok "regular file intact" '[ "$(cat notsock)" = keep ]'
+warmer run -d --name u2 -p "$W/stale.sock:19211" ./be.sh 19211 >/dev/null
+pkill -9 -x warmerd; sleep .5
+warmer ps >/dev/null   # next call restarts the daemon and rebinds stale sockets
+ok "stale socket reclaimed after kill -9" '[ "$(ucode "$W/stale.sock")" = 200 ]'
+warmer stop u2 >/dev/null
+ok "socket gone after stop" '[ ! -e "$W/stale.sock" ]'
+
 echo "# env + cwd passthrough"
 mkdir sub; cat > sub/envbe.sh <<'X'
 #!/bin/sh

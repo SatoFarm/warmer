@@ -12,6 +12,7 @@ My PC is small, but there are a lot of things I want to run. Running all at once
 
 ```
 warmer run [-d] [--name <n>] [--idle <secs>] -p <host>:<backend> <command...>
+warmer run [-d] [--name <n>] [--idle <secs>] -p <sockpath>:<backend> <command...>
 warmer ps
 warmer logs [-f] <name>
 warmer stop <name>
@@ -27,6 +28,9 @@ warmer run --idle 300 -p 8080:8081 python3 -m http.server 8081
 
 # detached, named
 warmer run -d --name llama -p 9000:9001 llama-server --port 9001 -m model.gguf
+
+# backend on 8081 exposed on a unix socket instead of a port
+warmer run --idle 300 -p $HOME/llama.sock:8081 llama-server --port 8081 -m model.gguf
 
 warmer ps            # NAME   STATE    PORT
 warmer logs -f llama

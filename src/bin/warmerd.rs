@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex as AMutex};
@@ -155,7 +155,7 @@ async fn connect_backend(e: &Arc<Entry>, backend: u16) -> Result<TcpStream, Stri
     Err("backend not ready in time".into())
 }
 
-async fn serve_conn(e: Arc<Entry>, backend: u16, mut front: TcpStream) {
+async fn serve_conn(e: Arc<Entry>, backend: u16, mut front: impl AsyncRead + AsyncWrite + Unpin) {
     e.active.fetch_add(1, SeqCst); // before spawning, so the idle watcher cannot kill under us
     match connect_backend(&e, backend).await {
         Ok(mut back) => {
@@ -179,11 +179,42 @@ async fn idle_watch(e: Arc<Entry>) {
     }
 }
 
+enum Listen {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+/// Bind a front. A leftover socket file from a dead daemon is reclaimed, but a live
+/// one or a regular file is never touched.
+async fn bind_front(p: &PortMap) -> Result<Listen, String> {
+    let Some(path) = &p.sock else {
+        let l = TcpListener::bind((p.bind.as_str(), p.host)).await.map_err(|er| format!("bind {}: {er}", p.front()))?;
+        return Ok(Listen::Tcp(l));
+    };
+    if let Ok(m) = std::fs::metadata(path) {
+        if !m.file_type().is_socket() || std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(format!("bind {path}: exists and is not a stale socket"));
+        }
+        std::fs::remove_file(path).map_err(|er| format!("bind {path}: {er}"))?;
+    }
+    Ok(Listen::Unix(UnixListener::bind(path).map_err(|er| format!("bind {path}: {er}"))?))
+}
+
 /// Bind all ports, then register the entry. Binding first means a failure leaves nothing behind.
 async fn add(db: &Db, spec: Spec) -> Result<Arc<Entry>, String> {
     let mut listeners = vec![];
+    let mut made: Vec<&str> = vec![]; // socket files we created; a later failed bind must not leave them
     for p in &spec.ports {
-        let l = TcpListener::bind((p.bind.as_str(), p.host)).await.map_err(|er| format!("bind {}:{}: {er}", p.bind, p.host))?;
+        let l = match bind_front(p).await {
+            Ok(l) => l,
+            Err(er) => {
+                for s in made {
+                    let _ = std::fs::remove_file(s);
+                }
+                return Err(er);
+            }
+        };
+        made.extend(p.sock.as_deref());
         listeners.push((l, p.backend));
     }
     let e = Arc::new(Entry {
@@ -199,8 +230,17 @@ async fn add(db: &Db, spec: Spec) -> Result<Arc<Entry>, String> {
     for (l, backend) in listeners {
         let e = e.clone();
         tasks.push(tokio::spawn(async move {
-            while let Ok((s, _)) = l.accept().await {
-                tokio::spawn(serve_conn(e.clone(), backend, s));
+            match l {
+                Listen::Tcp(l) => {
+                    while let Ok((s, _)) = l.accept().await {
+                        tokio::spawn(serve_conn(e.clone(), backend, s));
+                    }
+                }
+                Listen::Unix(l) => {
+                    while let Ok((s, _)) = l.accept().await {
+                        tokio::spawn(serve_conn(e.clone(), backend, s));
+                    }
+                }
             }
         }));
     }
@@ -212,6 +252,11 @@ async fn add(db: &Db, spec: Spec) -> Result<Arc<Entry>, String> {
 async fn stop(e: &Entry) {
     for t in e.tasks.lock().unwrap().drain(..) {
         t.abort();
+    }
+    for p in &e.spec.ports {
+        if let Some(s) = &p.sock {
+            let _ = std::fs::remove_file(s);
+        }
     }
     kill_child(&mut *e.child.lock().await).await;
 }
